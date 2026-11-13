@@ -1,0 +1,14 @@
+PySide6>=6.8
+pdfplumber>=0.11
+pypdfium2>=4.30
+Pillow>=10.0
+PyMySQL>=1.1
+winrt-runtime>=2.0
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
+winrt-Windows.Globalization
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Media.Ocr
+winrt-Windows.Storage.Streams
+# Optional OCR fallback if Windows OCR is unavailable:
+# rapidocr-onnxruntime
