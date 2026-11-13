@@ -231,6 +231,10 @@ def test_migrates_mixed_emt_history_once(tmp_path):
     two.lines[0] = LineItem("EMT2", '2" X 10FT', 10, "FT", 470.42, 100, 47.04)
     old.save_invoice(two)
     old.save_invoice(_one_line("3", "ARL", "EMT150", 1.77, "c"))
+    # Roll the database back to a faithful v2 state (v4's sync artifacts must not exist yet).
+    old.execute("DROP INDEX ix_invoices_sync_uid")
+    old.execute("ALTER TABLE invoices DROP COLUMN sync_uid")
+    old.execute("DROP TABLE sync_deletions")
     old.execute("PRAGMA user_version = 2")
     old.close()
     repaired = Database(path)

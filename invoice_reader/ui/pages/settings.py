@@ -5,7 +5,7 @@ from datetime import datetime
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -136,17 +136,18 @@ class SettingsPage(QWidget):
         f.addRow("", buttons)
         lay.addWidget(g)
 
-        # Database connection
-        g = QGroupBox("Database")
+        # Server sync
+        g = QGroupBox("Server sync")
         f = QFormLayout(g)
-        f.addRow("In use now", QLabel(self.win.db.backend.describe()))
         cfg = config.load_db_config()
-        self.db_engine = QComboBox()
-        self.db_engine.addItem("Local file (SQLite)", "sqlite")
-        self.db_engine.addItem("MySQL / MariaDB server", "mysql")
-        self.db_engine.setCurrentIndex(max(0, self.db_engine.findData(cfg["engine"])))
-        self.db_engine.currentIndexChanged.connect(self._db_engine_changed)
-        f.addRow("Store data in", self.db_engine)
+        self.sync_enabled = QCheckBox("Sync with a MySQL / MariaDB server so other PCs and apps share this data")
+        self.sync_enabled.setChecked(cfg["engine"] == "mysql")
+        self.sync_enabled.toggled.connect(self._db_engine_changed)
+        f.addRow(self.sync_enabled)
+        self.sync_status = QLabel(win.sync.status)
+        self.sync_status.setWordWrap(True)
+        win.sync.status_changed.connect(self.sync_status.setText)
+        f.addRow("Status", self.sync_status)
         self.db_host = QLineEdit(cfg["host"])
         self.db_host.setPlaceholderText("e.g. 192.168.1.10 or db.mycompany.com")
         f.addRow("Host", self.db_host)
@@ -162,17 +163,20 @@ class SettingsPage(QWidget):
         self.db_password.setEchoMode(QLineEdit.Password)
         f.addRow("Password", self.db_password)
         buttons = QHBoxLayout()
-        for text, slot in (("Test connection", self._db_test), ("Save database settings", self._db_save),
-                           ("Copy local data to server...", self._db_copy_to_server)):
+        for text, slot in (("Test connection", self._db_test), ("Save sync settings", self._db_save),
+                           ("Sync now", self._db_sync_now)):
             b = QPushButton(text)
             b.clicked.connect(slot)
             buttons.addWidget(b)
         buttons.addStretch(1)
         f.addRow("", buttons)
-        f.addRow("", _hint("A server database lets several PCs share the same invoices and products, and other "
-                           "apps can read it (give them a read-only account). The database and user must already "
-                           "exist on the server; tables are created automatically. Settings are stored in "
-                           "database.json in the data folder and take effect the next time the app starts."))
+        f.addRow("", _hint("The app always works from its local database, so nothing slows down or breaks when "
+                           "the server is unreachable. When sync is on, new invoices and deletions are exchanged "
+                           "with the server automatically (after every change, at startup and every few minutes), "
+                           "so every PC ends up with the same invoices, and other apps can read the server copy "
+                           "with a read-only account. The database and user must already exist on the server; "
+                           "tables are created automatically. Settings are stored in database.json in the data "
+                           "folder."))
         self._db_engine_changed()
         lay.addWidget(g)
 
@@ -253,15 +257,15 @@ class SettingsPage(QWidget):
             self.win.db.backup(path)
             QMessageBox.information(self, "Backup complete", f"Database backed up to\n{path}")
 
-    # ---- database connection --------------------------------------------
+    # ---- server sync ------------------------------------------------------
     def _db_engine_changed(self) -> None:
-        remote = self.db_engine.currentData() == "mysql"
+        remote = self.sync_enabled.isChecked()
         for w in (self.db_host, self.db_port, self.db_name, self.db_user, self.db_password):
             w.setEnabled(remote)
 
     def _db_config(self) -> dict:
         return {
-            "engine": self.db_engine.currentData(),
+            "engine": "mysql" if self.sync_enabled.isChecked() else "sqlite",
             "host": self.db_host.text().strip(),
             "port": self.db_port.value(),
             "database": self.db_name.text().strip(),
@@ -272,7 +276,7 @@ class SettingsPage(QWidget):
     def _db_test(self) -> None:
         cfg = self._db_config()
         if cfg["engine"] != "mysql":
-            QMessageBox.information(self, "Test connection", "The local SQLite file needs no connection.")
+            QMessageBox.information(self, "Test connection", "Turn on server sync first.")
             return
         from invoice_reader.backends import test_mysql_connection
         try:
@@ -285,43 +289,18 @@ class SettingsPage(QWidget):
     def _db_save(self) -> None:
         cfg = self._db_config()
         if cfg["engine"] == "mysql" and not (cfg["host"] and cfg["database"] and cfg["user"]):
-            QMessageBox.warning(self, "Database settings", "Enter the host, database name and user first.")
+            QMessageBox.warning(self, "Sync settings", "Enter the host, database name and user first.")
             return
         config.save_db_config(cfg)
-        QMessageBox.information(self, "Database settings saved",
-                                "The new database will be used the next time the app starts.")
-
-    def _db_copy_to_server(self) -> None:
-        cfg = self._db_config()
+        self.win.sync.configure()
         if cfg["engine"] != "mysql":
-            QMessageBox.information(self, "Copy data", "Select the MySQL / MariaDB server engine first.")
+            QMessageBox.information(self, "Sync settings saved", "Server sync is off.")
+
+    def _db_sync_now(self) -> None:
+        if not self.win.sync.enabled:
+            QMessageBox.information(self, "Sync now", "Turn on server sync and save the settings first.")
             return
-        if self.win.db.backend.engine != "sqlite":
-            QMessageBox.information(self, "Copy data", "You are already using the server database.")
-            return
-        if QMessageBox.question(
-                self, "Copy local data to server",
-                "Copy all local invoices, products, price history and settings to the server database?\n\n"
-                "The server database must be empty. Your local file is not changed.") != QMessageBox.Yes:
-            return
-        from invoice_reader.backends import create_backend
-        from invoice_reader.db import Database, copy_database
-        try:
-            remote = Database(create_backend(cfg))
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Connection failed", str(exc))
-            return
-        try:
-            counts = copy_database(self.win.db, remote)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Copy failed", str(exc))
-            return
-        finally:
-            remote.close()
-        summary = "\n".join(f"  {table}: {n:,}" for table, n in counts.items() if n)
-        QMessageBox.information(self, "Copy complete",
-                                f"Copied to the server:\n{summary}\n\nSave the database settings and restart "
-                                "the app to start using it.")
+        self.win.sync.request_sync()
 
     # ---- updates ----------------------------------------------------------
     def _update_from_git(self) -> None:

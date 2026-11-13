@@ -91,14 +91,14 @@ running the newest `InvoiceReaderSetup.exe`.
 Data lives in `%LOCALAPPDATA%\InvoiceReader` (`invoices.db`, `archive\<year>\<vendor>\` copies of every
 imported file, and `logs\`). Set `INVOICE_READER_DATA` to use another folder.
 
-## Remote database (MySQL / MariaDB)
+## Server sync (MySQL / MariaDB)
 
-By default everything is stored in the local SQLite file. To share one live database between several PCs
-(and let other apps read it), point the app at a MySQL or MariaDB server from
-**Settings > Database**: choose *MySQL / MariaDB server*, enter the host, database name and credentials,
-*Test connection*, then *Save database settings* and restart the app. Tables are created automatically on
-first connect, and *Copy local data to server* moves your existing local invoices, products and price
-history into an empty server database.
+The app always works from its local SQLite file, so it is fast and fully usable offline. To share data
+between several PCs (and let other apps read it), turn on **Settings > Server sync** and point it at a
+MySQL or MariaDB server: every PC pushes invoices and deletions the server doesn't know about and pulls
+the ones it is missing - automatically after every change, at startup and every few minutes, or with
+*Sync now*. Tables are created automatically on first sync; product name/category/notes edits follow the
+most recent change, and an invoice imported independently on two PCs is recognized and kept once.
 
 Create the database and app user on the server first:
 
@@ -118,8 +118,9 @@ GRANT SELECT ON invoice_reader.* TO 'invoice_ro'@'%';
 
 Connection settings are stored in `database.json` in the data folder (the password is stored in plain
 text, so use a dedicated least-privilege account). Notes: file backup from Settings applies to the local
-SQLite file only - back up a server database with the server's tools (e.g. `mysqldump`); archived invoice
-files stay on the PC that imported them, so the original document preview is available there.
+SQLite file - back up the server database with the server's tools (e.g. `mysqldump`); archived invoice
+files stay on the PC that imported them, so the original document preview is available there; app
+settings (watch folder etc.) stay per-PC.
 
 Adding another engine later means implementing one more `Backend` subclass in
 `invoice_reader/backends.py` (connection, SQL-dialect translation, and schema script).

@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 
 from invoice_reader import APP_NAME
 from invoice_reader.core.importer import DUPLICATE, ERROR, QUEUED, UNSUPPORTED, ImportManager
+from invoice_reader.core.sync import SyncManager
 from invoice_reader.core.watcher import FolderWatcher
 from invoice_reader.db import INBOX_FAILED, INBOX_PENDING, INBOX_PROCESSING, Database
 from invoice_reader.models import ParsedInvoice
@@ -47,6 +48,7 @@ class MainWindow(QMainWindow):
 
         self.importer = ImportManager(db, self)
         self.watcher = FolderWatcher(db, self.importer, self)
+        self.sync = SyncManager(db, self)
 
         central = QWidget()
         root = QHBoxLayout(central)
@@ -103,10 +105,13 @@ class MainWindow(QMainWindow):
         self.importer.busy_changed.connect(self._on_busy)
         self.importer.notify.connect(self.notify)
         self.watcher.status_changed.connect(self._on_watch_status)
+        self.sync.pulled_changes.connect(self.data_changed)
+        self.sync.finished.connect(self._on_sync_finished)
 
         self.nav.setCurrentRow(0)
         self.importer.resume()
         self.watcher.configure()
+        self.sync.configure()
         self._update_badge()
 
     # ---- navigation -----------------------------------------------------
@@ -135,6 +140,13 @@ class MainWindow(QMainWindow):
     def data_changed(self) -> None:
         self._dirty.update(self.pages)
         self._refresh_if_dirty(self._current_key())
+        self.sync.request_sync()
+
+    def _on_sync_finished(self, ok: bool, summary: str) -> None:
+        if not ok:
+            self.statusBar().showMessage(f"Server sync failed: {summary}", 10000)
+        elif summary != "already up to date":
+            self.statusBar().showMessage(f"Server sync: {summary}", 6000)
 
     def show_product(self, product_id: int) -> None:
         self.navigate("products")

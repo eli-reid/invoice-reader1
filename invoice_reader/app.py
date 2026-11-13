@@ -103,10 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         db = open_database()
     except Exception as exc:  # noqa: BLE001
         log.exception("Cannot open database")
-        target = config.load_db_config()
-        where = (f"{target.get('database')} on {target.get('host')}" if target.get("engine") == "mysql"
-                 else str(config.db_path()))
-        QMessageBox.critical(None, APP_NAME, f"Could not open the database:\n{where}\n\n{exc}")
+        QMessageBox.critical(None, APP_NAME, f"Could not open the database:\n{config.db_path()}\n\n{exc}")
         return 1
     first_run_defaults(db)
 

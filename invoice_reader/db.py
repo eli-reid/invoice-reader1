@@ -4,9 +4,11 @@ file by default, or a shared server database via invoice_reader.backends."""
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import re
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -114,6 +116,15 @@ MIGRATIONS: list[str] = [
     """,
     # v3: repair recognizable EMT conduit history using the diameter in its description.
     "",
+    # v4: global invoice identity + deletion tombstones for syncing with a shared server database.
+    """
+    ALTER TABLE invoices ADD COLUMN sync_uid TEXT;
+    CREATE UNIQUE INDEX ix_invoices_sync_uid ON invoices(sync_uid);
+    CREATE TABLE sync_deletions (
+        uid        TEXT PRIMARY KEY,
+        deleted_at TEXT NOT NULL
+    );
+    """,
 ]
 
 INBOX_PROCESSING = "processing"
@@ -187,18 +198,40 @@ class Database:
         version = self.backend.schema_version()
         if version >= len(scripts):
             return
+        # Data repairs that need Python, keyed by (engine, version just applied).
+        hooks = {
+            ("sqlite", 3): self._repair_emt_history,
+            ("sqlite", 4): self._backfill_sync_uids,
+            ("mysql", 2): self._backfill_sync_uids,
+        }
         self.backend.pre_migrate()
         try:
             for i, script in enumerate(scripts[version:], start=version + 1):
                 with self.transaction() as c:
                     for statement in filter(str.strip, script.split(";")):
                         c.execute(statement)
-                    if self.backend.engine == "sqlite" and i == 3:
-                        self._repair_emt_history(c)
+                    hook = hooks.get((self.backend.engine, i))
+                    if hook:
+                        hook(c)
                     self.backend.check_migration_integrity()
                     self.backend.set_schema_version(i)
         finally:
             self.backend.post_migrate()
+
+    @staticmethod
+    def _backfill_sync_uids(c: Backend) -> None:
+        """Give pre-sync invoices a deterministic identity, so databases that already
+        share data (e.g. a server populated by 'copy local data') pair up instead of
+        duplicating on the first sync."""
+        rows = c.execute(
+            "SELECT i.id, i.invoice_number, i.invoice_date, i.total, i.imported_at, i.file_hash, "
+            "v.name AS vendor FROM invoices i LEFT JOIN vendors v ON v.id = i.vendor_id "
+            "WHERE i.sync_uid IS NULL").fetchall()
+        for r in rows:
+            basis = r["file_hash"] or "|".join(
+                str(r[k]) for k in ("id", "vendor", "invoice_number", "invoice_date", "total", "imported_at"))
+            c.execute("UPDATE invoices SET sync_uid = ? WHERE id = ?",
+                      (hashlib.sha256(basis.encode("utf-8")).hexdigest(), r["id"]))
 
     def _repair_emt_history(self, c: Backend) -> None:
         rows = c.execute(
@@ -285,7 +318,7 @@ class Database:
         return row["id"] if row else None
 
     def save_invoice(self, inv: ParsedInvoice, archived_path: str | None = None,
-                     allow_duplicate: bool = False) -> int:
+                     allow_duplicate: bool = False, sync_uid: str | None = None) -> int:
         if not allow_duplicate:
             existing = self.find_invoice(inv.vendor, inv.invoice_number)
             if existing:
@@ -300,10 +333,10 @@ class Database:
                 file_hash = None  # same file imported twice deliberately; keep both rows
             cur = c.execute(
                 "INSERT INTO invoices(vendor_id, invoice_number, invoice_date, total, file_path, "
-                "original_name, file_hash, method, imported_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                "original_name, file_hash, method, imported_at, sync_uid) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (vendor_id, inv.invoice_number.strip(), inv.invoice_date, inv.total,
                  archived_path or inv.source_path, Path(inv.source_path).name if inv.source_path else "",
-                 file_hash, inv.method, ts))
+                 file_hash, inv.method, ts, sync_uid or uuid.uuid4().hex))
             invoice_id = cur.lastrowid
             for line in inv.lines:
                 product_id = self._product_id(c, line, match_mfr, ts)
@@ -356,6 +389,11 @@ class Database:
 
     def delete_invoice(self, invoice_id: int) -> None:
         with self.transaction() as c:
+            row = c.execute("SELECT sync_uid FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
+            if row and row["sync_uid"]:
+                # Tombstone so the deletion propagates to the server (and other PCs) on sync.
+                c.execute("INSERT OR IGNORE INTO sync_deletions(uid, deleted_at) VALUES(?, ?)",
+                          (row["sync_uid"], now_iso()))
             c.execute("UPDATE inbox SET status = ?, updated_at = ? WHERE invoice_id = ?",
                       (INBOX_IGNORED, now_iso(), invoice_id))
             c.execute("DELETE FROM invoices WHERE id = ?", (invoice_id,))
@@ -573,15 +611,16 @@ class Database:
 
 
 def open_database() -> Database:
-    """Open the database configured in database.json (local SQLite file by default)."""
+    """Open the local working database. (A configured server database is a sync
+    target, handled by invoice_reader.core.sync, not the primary store.)"""
     from invoice_reader import config
-    from invoice_reader.backends import create_backend
 
-    return Database(create_backend(config.load_db_config()))
+    return Database(config.db_path())
 
 
 # Insert order respects foreign keys; ids are preserved so references stay intact.
-_COPY_TABLES = ["settings", "vendors", "products", "invoices", "price_history", "inbox", "vendor_aliases"]
+_COPY_TABLES = ["settings", "vendors", "products", "invoices", "price_history", "inbox", "vendor_aliases",
+                "sync_deletions"]
 
 
 def copy_database(src: Database, dst: Database) -> dict[str, int]:

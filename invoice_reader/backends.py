@@ -255,6 +255,15 @@ MYSQL_MIGRATIONS = [
         vendor VARCHAR(255) NOT NULL
     )
     """,
+    # v2: global invoice identity + deletion tombstones for two-way sync with local databases.
+    """
+    ALTER TABLE invoices ADD COLUMN sync_uid VARCHAR(64) NULL;
+    ALTER TABLE invoices ADD UNIQUE KEY ix_invoices_sync_uid (sync_uid);
+    CREATE TABLE sync_deletions (
+        uid        VARCHAR(64) NOT NULL PRIMARY KEY,
+        deleted_at VARCHAR(32) NOT NULL
+    )
+    """,
 ]
 
 
