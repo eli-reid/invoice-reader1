@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self.importer.notify.connect(self.notify)
         self.watcher.status_changed.connect(self._on_watch_status)
         self.sync.pulled_changes.connect(self.data_changed)
+        self.sync.settings_restored.connect(self._on_settings_restored)
         self.sync.finished.connect(self._on_sync_finished)
 
         self.nav.setCurrentRow(0)
@@ -157,6 +158,12 @@ class MainWindow(QMainWindow):
         elif summary != "already up to date":
             self.statusBar().showMessage(f"Server sync: {summary}", 6000)
 
+    def _on_settings_restored(self) -> None:
+        self.pages["settings"].reload_preferences()
+        self.watcher.configure()
+        self._dirty.update({"settings", "dashboard"})
+        self._schedule_refresh()
+
     def show_product(self, product_id: int) -> None:
         self.navigate("products")
         self.pages["products"].select_product(product_id)
@@ -171,6 +178,7 @@ class MainWindow(QMainWindow):
                                                 FILE_FILTER)
         if files:
             self.db.set_setting("last_import_dir", str(Path(files[0]).parent))
+            self.sync.request_sync()
             self.import_files(files)
 
     def import_files(self, files: list[str]) -> None:
@@ -240,6 +248,7 @@ class MainWindow(QMainWindow):
             self.watcher.change_folder(str(Path(folder)))
             self.db.set_setting("watch_enabled", True)
             self.watcher.configure()
+            self.sync.request_sync()
             self.pages["settings"].watch_enabled.setChecked(True)
             self._dirty.update({"settings", "dashboard"})
             self._refresh_if_dirty(self._current_key())

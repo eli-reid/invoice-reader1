@@ -264,6 +264,16 @@ MYSQL_MIGRATIONS = [
         deleted_at VARCHAR(32) NOT NULL
     )
     """,
+    # v3: preferences belong to a PC, not to the shared invoice database.
+    """
+    CREATE TABLE pc_settings (
+        pc_id      CHAR(64) NOT NULL,
+        `key`      VARCHAR(100) NOT NULL,
+        value      TEXT,
+        updated_at VARCHAR(32) NOT NULL,
+        PRIMARY KEY(pc_id, `key`)
+    )
+    """,
 ]
 
 

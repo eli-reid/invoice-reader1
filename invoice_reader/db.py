@@ -125,6 +125,16 @@ MIGRATIONS: list[str] = [
         deleted_at TEXT NOT NULL
     );
     """,
+    # v5: server backups of app preferences, isolated by the originating PC.
+    """
+    CREATE TABLE pc_settings (
+        pc_id      TEXT NOT NULL,
+        key        TEXT NOT NULL,
+        value      TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(pc_id, key)
+    );
+    """,
 ]
 
 INBOX_PROCESSING = "processing"
@@ -636,7 +646,7 @@ def open_database() -> Database:
 
 # Insert order respects foreign keys; ids are preserved so references stay intact.
 _COPY_TABLES = ["settings", "vendors", "products", "invoices", "price_history", "inbox", "vendor_aliases",
-                "sync_deletions"]
+                "sync_deletions", "pc_settings"]
 
 
 def copy_database(src: Database, dst: Database) -> dict[str, int]:

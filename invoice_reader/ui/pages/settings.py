@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSignalBlocker, Qt
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
     QMessageBox, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
@@ -79,20 +79,20 @@ class SettingsPage(QWidget):
         f = QFormLayout(g)
         self.auto_import = QCheckBox("Save invoices automatically when every line checks out")
         self.auto_import.setChecked(db.get_bool("auto_import"))
-        self.auto_import.toggled.connect(lambda v: db.set_setting("auto_import", v))
+        self.auto_import.toggled.connect(lambda v: self._set_preference("auto_import", v))
         f.addRow(self.auto_import)
         f.addRow(_hint("When off, every invoice waits in the Import queue for you to review. When on, invoices "
                        "where vendor, invoice #, date and every line's math (qty \u00d7 price = extended) are "
                        "verified are saved without review; everything else still waits for you."))
         self.company = QLineEdit(db.get_setting("company_names"))
         self.company.setPlaceholderText("e.g. Midstate Electric; Midstate Electrical Contractors")
-        self.company.editingFinished.connect(lambda: db.set_setting("company_names", self.company.text()))
+        self.company.editingFinished.connect(lambda: self._set_preference("company_names", self.company.text()))
         f.addRow("Your company name(s)", self.company)
         f.addRow("", _hint("Separate names with ';'. Used so your Bill To / Ship To name is never taken as the "
                            "vendor."))
         self.match_mfr = QCheckBox("Match products by item # and manufacturer")
         self.match_mfr.setChecked(db.get_bool("match_manufacturer"))
-        self.match_mfr.toggled.connect(lambda v: db.set_setting("match_manufacturer", v))
+        self.match_mfr.toggled.connect(lambda v: self._set_preference("match_manufacturer", v))
         f.addRow(self.match_mfr)
         f.addRow(_hint("When off, the same item # is always one product. When on, the same item # from different "
                        "manufacturers (e.g. CRS 11 vs. another brand's 11) gets its own price history. Applies to "
@@ -109,7 +109,7 @@ class SettingsPage(QWidget):
         f.addRow(self.autostart)
         self.tray = QCheckBox("Keep running in the system tray when the window is closed")
         self.tray.setChecked(db.get_bool("close_to_tray"))
-        self.tray.toggled.connect(lambda v: db.set_setting("close_to_tray", v))
+        self.tray.toggled.connect(lambda v: self._set_preference("close_to_tray", v))
         f.addRow(self.tray)
         lay.addWidget(g)
 
@@ -173,8 +173,10 @@ class SettingsPage(QWidget):
         f.addRow("", _hint("The app always works from its local database, so nothing slows down or breaks when "
                            "the server is unreachable. When sync is on, new invoices and deletions are exchanged "
                            "with the server automatically (after every change, at startup and every few minutes), "
-                           "so every PC ends up with the same invoices, and other apps can read the server copy "
-                           "with a read-only account. The database and user must already exist on the server; "
+                           "so every PC ends up with the same invoices. App preferences are backed up under a "
+                           "hashed PC ID; only missing local preferences are restored, never another PC's. "
+                           "Server credentials and Windows startup registration stay local. Other apps can read "
+                           "the server copy with a read-only account. The database and user must already exist; "
                            "tables are created automatically. Settings are stored in database.json in the data "
                            "folder."))
         self._db_engine_changed()
@@ -225,8 +227,24 @@ class SettingsPage(QWidget):
             self.since.setText(f"Files added to this folder after {when:%b %d, %Y %I:%M %p} are imported "
                                "automatically. Use the button below to also import files that were already there.")
 
-    def _set_and_reconfigure(self, key: str, value) -> None:
+    def reload_preferences(self) -> None:
+        db = self.win.db
+        for widget, key in ((self.watch_enabled, "watch_enabled"), (self.recursive, "watch_recursive"),
+                            (self.auto_import, "auto_import"), (self.match_mfr, "match_manufacturer"),
+                            (self.tray, "close_to_tray")):
+            with QSignalBlocker(widget):
+                widget.setChecked(db.get_bool(key))
+        with QSignalBlocker(self.interval):
+            self.interval.setValue(int(db.get_setting("watch_interval") or 10))
+        self.company.setText(db.get_setting("company_names"))
+        self.refresh()
+
+    def _set_preference(self, key: str, value) -> None:
         self.win.db.set_setting(key, value)
+        self.win.sync.request_sync()
+
+    def _set_and_reconfigure(self, key: str, value) -> None:
+        self._set_preference(key, value)
         self.win.watcher.configure()
 
     def _scan_existing(self) -> None:

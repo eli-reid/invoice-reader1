@@ -127,6 +127,17 @@ SQLite file - back up the server database with the server's tools (e.g. `mysqldu
 files stay on the PC that imported them, so the original document preview is available there; app
 settings (watch folder etc.) stay per-PC.
 
+Stored app preferences are backed up in `pc_settings`, keyed by `(pc_id, key)`. The PC ID is a SHA-256
+hash of Windows' MachineGuid with an app-specific prefix, not the computer name: renaming the PC or
+copying the local database to another PC does not mix their settings. The raw MachineGuid is not sent
+to the server. On sync, only missing local preference rows are restored from that PC's backup;
+existing local values (including saved defaults) always take priority. Preference changes are backed
+up automatically while server sync is enabled. Reconnect to the same server after reinstalling to
+recover missing preferences. Reinstalling Windows can change the PC ID.
+
+Connection credentials in `database.json` and the Windows startup registration are not backed up.
+Legacy, unscoped server `settings` rows are left untouched and are never restored to a PC.
+
 Adding another engine later means implementing one more `Backend` subclass in
 `invoice_reader/backends.py` (connection, SQL-dialect translation, and schema script).
 

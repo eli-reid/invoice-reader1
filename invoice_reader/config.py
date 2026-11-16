@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -17,6 +18,25 @@ def data_dir() -> Path:
 
 def db_path() -> Path:
     return data_dir() / "invoices.db"
+
+
+def _windows_machine_guid() -> str:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography",
+                        0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY) as key:
+        return winreg.QueryValueEx(key, "MachineGuid")[0]
+
+
+def pc_id() -> str:
+    """Stable PC identity, independent of copied app data or the computer's name."""
+    try:
+        guid = _windows_machine_guid()
+    except OSError as exc:
+        raise RuntimeError("Cannot read the Windows machine identity for per-PC settings backup.") from exc
+    if not isinstance(guid, str) or not guid.strip():
+        raise RuntimeError("The Windows machine identity is empty or invalid.")
+    return hashlib.sha256(f"{APP_ID}:pc:{guid.strip().lower()}".encode("utf-8")).hexdigest()
 
 
 DEFAULT_DB_CONFIG = {

@@ -2,9 +2,15 @@
 the algorithm only uses the Database API, so the engine does not matter)."""
 import pytest
 
+from invoice_reader import config
 from invoice_reader.core.sync import sync_databases
 from invoice_reader.db import Database
 from invoice_reader.models import LineItem, ParsedInvoice
+
+
+@pytest.fixture(autouse=True)
+def pc_identity(monkeypatch):
+    monkeypatch.setattr(config, "pc_id", lambda: "a" * 64)
 
 
 @pytest.fixture
@@ -44,7 +50,8 @@ def test_push_and_pull(local, remote):
     assert uids(local) == uids(remote)
     assert sync_databases(local, remote) == {
         "pushed": 0, "pulled": 0, "deleted_local": 0, "deleted_remote": 0,
-        "adopted": 0, "products": 0, "aliases": 0}
+        "adopted": 0, "products": 0, "aliases": 0,
+        "settings_backed_up": 0, "settings_restored": 0}
 
     # the pulled invoice's lines made it into price history
     rexel = next(r for r in local.list_invoices() if r["invoice_number"] == "R-1")
@@ -102,3 +109,73 @@ def test_vendor_aliases_merge(local, remote):
     expected = {"EW -": "Electrical Wholesalers", "GB": "Graybar"}
     assert local.vendor_aliases() == expected
     assert remote.vendor_aliases() == expected
+
+
+def test_settings_backups_are_scoped_to_pc_and_exclude_credentials(local, remote, tmp_path):
+    pc_a, pc_b = "a" * 64, "b" * 64
+    local.set_setting("watch_folder", r"C:\InvoicesA")
+    local.set_setting("auto_import", True)
+    local.set_setting("password", "do-not-back-up")
+    local.set_setting("initialized", "1")
+    remote.set_setting("watch_folder", r"C:\LegacyGlobalFolder")
+    assert sync_databases(local, remote, pc_a)["settings_backed_up"] == 2
+    with_second = Database(tmp_path / "second.db")
+    try:
+        with_second.set_setting("watch_folder", r"D:\InvoicesB")
+        with_second.set_setting("auto_import", False)
+        assert sync_databases(with_second, remote, pc_b)["settings_backed_up"] == 2
+        assert with_second.get_setting("watch_folder") == r"D:\InvoicesB"
+        local.set_setting("watch_folder", r"C:\UpdatedA")
+        assert sync_databases(local, remote, pc_a)["settings_backed_up"] == 1
+        sync_databases(with_second, remote, pc_b)
+        rows = {(r["pc_id"], r["key"]): r["value"] for r in remote.query("SELECT * FROM pc_settings")}
+        assert rows == {
+            (pc_a, "watch_folder"): r"C:\UpdatedA", (pc_a, "auto_import"): "1",
+            (pc_b, "watch_folder"): r"D:\InvoicesB", (pc_b, "auto_import"): "0"}
+        assert remote.get_setting("watch_folder") == r"C:\LegacyGlobalFolder"
+    finally:
+        with_second.close()
+
+
+def test_restores_only_same_pcs_missing_settings_and_preserves_empty_values(local, remote, tmp_path):
+    local.set_setting("watch_folder", r"C:\SavedFolder")
+    local.set_setting("auto_import", True)
+    local.set_setting("company_names", "Test Company")
+    local.set_setting("watch_interval", 25)
+    sync_databases(local, remote, "a" * 64)
+    restored = Database(tmp_path / "reinstalled.db")
+    try:
+        # A new PC must not inherit anything, including legacy unscoped server settings.
+        remote.set_setting("company_names", "Wrong Company")
+        assert sync_databases(restored, remote, "b" * 64)["settings_restored"] == 0
+        assert restored.query("SELECT * FROM settings") == []
+        # An empty path and an explicit "off" are existing preferences, not missing ones.
+        restored.set_setting("watch_folder", "")
+        restored.set_setting("auto_import", False)
+        counts = sync_databases(restored, remote, "a" * 64)
+        assert counts["settings_restored"] == 2
+        assert restored.get_setting("company_names") == "Test Company"
+        assert restored.get_setting("watch_interval") == "25"
+        assert restored.get_setting("watch_folder") == ""
+        assert not restored.get_bool("auto_import")
+        counts = sync_databases(restored, remote, "a" * 64)
+        assert counts["settings_backed_up"] == counts["settings_restored"] == 0
+    finally:
+        restored.close()
+
+
+def test_copied_local_database_uses_new_pcs_identity(local, remote, tmp_path, monkeypatch):
+    local.set_setting("company_names", "Original PC")
+    sync_databases(local, remote)
+    path = tmp_path / "copied.db"
+    local.backup(path)
+    copied = Database(path)
+    try:
+        monkeypatch.setattr(config, "pc_id", lambda: "b" * 64)
+        copied.set_setting("company_names", "Copied PC")
+        sync_databases(copied, remote)
+        saved = {r["pc_id"]: r["value"] for r in remote.query(
+            "SELECT pc_id, value FROM pc_settings WHERE key = ?", ("company_names",))}
+        assert saved == {"a" * 64: "Original PC", "b" * 64: "Copied PC"}
+    finally:
+        copied.close()

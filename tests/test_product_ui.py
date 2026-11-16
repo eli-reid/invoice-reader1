@@ -11,6 +11,7 @@ from invoice_reader.db import Database
 from invoice_reader.models import LineItem, ParsedInvoice
 from invoice_reader.ui.pages.invoices import InvoicesPage
 from invoice_reader.ui.pages.products import ProductDialog, ProductsPage, PurchaseDialog
+from invoice_reader.ui.pages.settings import SettingsPage
 
 
 @pytest.fixture(scope="module")
@@ -39,6 +40,32 @@ def test_product_dialog_edits_item_number(win):
     assert dlg.result() == QDialog.Accepted
     win.db.update_product(product["id"], dlg.name.text(), "", "", item_number=dlg.item_number.text())
     assert win.db.get_product(product["id"])["item_number"] == "EMT1"
+
+
+def test_settings_edits_request_backup_and_restored_controls_do_not_resave(win, monkeypatch, tmp_path):
+    from invoice_reader.ui.main_window import MainWindow
+
+    monkeypatch.setenv("INVOICE_READER_DATA", str(tmp_path))
+    monkeypatch.setattr("invoice_reader.ui.pages.settings.update.is_source_checkout", lambda: False)
+    window = Mock(db=win.db, sync=Mock(status="Server sync is off"))
+    page = SettingsPage(window)
+    page.auto_import.setChecked(True)
+    assert win.db.get_bool("auto_import")
+    window.sync.request_sync.assert_called_once()
+    window.sync.request_sync.reset_mock()
+    win.db.set_setting("watch_enabled", False)
+    win.db.set_setting("watch_interval", 25)
+    win.db.set_setting("company_names", "Restored Company")
+    window.pages = {"settings": page}
+    window._dirty = set()
+    MainWindow._on_settings_restored(window)
+    assert not page.watch_enabled.isChecked()
+    assert page.auto_import.isChecked()
+    assert page.interval.value() == 25
+    assert page.company.text() == "Restored Company"
+    window.watcher.configure.assert_called_once()
+    window.sync.request_sync.assert_not_called()
+    page.deleteLater()
 
 
 def test_products_history_selects_individual_purchase_and_opens_invoice(win, monkeypatch):

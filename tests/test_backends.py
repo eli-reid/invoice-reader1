@@ -25,6 +25,15 @@ def test_multi_column_upsert_with_literal():
            "updated_at = VALUES(updated_at)" in out
 
 
+def test_pc_settings_composite_upsert_translation():
+    sql = ("INSERT INTO pc_settings(pc_id, key, value, updated_at) VALUES(?, ?, ?, ?) "
+           "ON CONFLICT(pc_id, key) DO UPDATE SET value = excluded.value, "
+           "updated_at = excluded.updated_at")
+    assert translate_sql_to_mysql(sql) == (
+        "INSERT INTO pc_settings(pc_id, `key`, value, updated_at) VALUES(%s, %s, %s, %s) "
+        "ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = VALUES(updated_at)")
+
+
 def test_collate_nocase_stripped_and_key_untouched_in_names():
     sql = "SELECT id FROM invoices WHERE invoice_number = ? COLLATE NOCASE ORDER BY item_key COLLATE NOCASE"
     assert (translate_sql_to_mysql(sql)
@@ -66,3 +75,31 @@ def test_copy_database(tmp_path):
         raise AssertionError("expected ValueError")
     except ValueError:
         pass
+
+
+def test_pc_id_is_stable_across_rename_but_differs_on_another_pc(monkeypatch):
+    from invoice_reader import config
+
+    guid = "11111111-abcd-1234-5678-000000000001"
+    monkeypatch.setattr(config, "_windows_machine_guid", lambda: guid)
+    original = config.pc_id()
+    monkeypatch.setenv("COMPUTERNAME", "Renamed-PC")
+    monkeypatch.setattr(config, "_windows_machine_guid", lambda: guid.upper())
+    assert config.pc_id() == original
+    assert len(original) == 64 and int(original, 16) >= 0
+    assert guid not in original
+    monkeypatch.setattr(config, "_windows_machine_guid",
+                        lambda: "22222222-abcd-1234-5678-000000000002")
+    assert config.pc_id() != original
+
+
+def test_unreadable_pc_identity_fails_instead_of_using_shared_fallback(monkeypatch):
+    import pytest
+    from invoice_reader import config
+
+    def denied():
+        raise PermissionError("MachineGuid unavailable")
+
+    monkeypatch.setattr(config, "_windows_machine_guid", denied)
+    with pytest.raises(RuntimeError, match="Cannot read the Windows machine identity"):
+        config.pc_id()

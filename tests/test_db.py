@@ -231,10 +231,11 @@ def test_migrates_mixed_emt_history_once(tmp_path):
     two.lines[0] = LineItem("EMT2", '2" X 10FT', 10, "FT", 470.42, 100, 47.04)
     old.save_invoice(two)
     old.save_invoice(_one_line("3", "ARL", "EMT150", 1.77, "c"))
-    # Roll the database back to a faithful v2 state (v4's sync artifacts must not exist yet).
+    # Roll the database back to a faithful v2 state.
     old.execute("DROP INDEX ix_invoices_sync_uid")
     old.execute("ALTER TABLE invoices DROP COLUMN sync_uid")
     old.execute("DROP TABLE sync_deletions")
+    old.execute("DROP TABLE pc_settings")
     old.execute("PRAGMA user_version = 2")
     old.close()
     repaired = Database(path)
@@ -249,3 +250,24 @@ def test_migrates_mixed_emt_history_once(tmp_path):
     reopened = Database(path)
     assert {p["item_number"]: dict(p) for p in reopened.list_products()} == products
     reopened.close()
+
+
+def test_migrates_existing_database_to_pc_settings_backups(tmp_path):
+    import sqlite3
+    from invoice_reader.db import MIGRATIONS
+
+    path = tmp_path / "before-pc-settings.db"
+    with sqlite3.connect(path) as old:
+        for script in MIGRATIONS[:4]:
+            old.executescript(script)
+        old.execute("PRAGMA user_version = 4")
+        old.execute("INSERT INTO settings(key, value) VALUES('watch_folder', ?)", (r"C:\Existing",))
+    upgraded = Database(path)
+    try:
+        assert upgraded.get_setting("watch_folder") == r"C:\Existing"
+        upgraded.execute(
+            "INSERT INTO pc_settings(pc_id, key, value, updated_at) VALUES(?, ?, ?, ?)",
+            ("a" * 64, "watch_folder", r"C:\Existing", "2026-01-01T00:00:00"))
+        assert upgraded.query_one("SELECT value FROM pc_settings")["value"] == r"C:\Existing"
+    finally:
+        upgraded.close()

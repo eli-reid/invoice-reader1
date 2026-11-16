@@ -15,18 +15,23 @@ import threading
 from PySide6.QtCore import QObject, QTimer, Signal
 
 from invoice_reader import config
-from invoice_reader.db import Database, DuplicateInvoiceError, now_iso
+from invoice_reader.db import DEFAULT_SETTINGS, Database, DuplicateInvoiceError, now_iso
 from invoice_reader.models import LineItem, ParsedInvoice
 
 log = logging.getLogger(__name__)
 
+PC_SETTING_KEYS = (*DEFAULT_SETTINGS, "last_import_dir")
+
 
 # ---- pure sync algorithm (works on any two Database objects) --------------
 
-def sync_databases(local: Database, remote: Database) -> dict[str, int]:
+def sync_databases(local: Database, remote: Database, pc_id: str | None = None) -> dict[str, int]:
     """Merge two databases; returns counts of what changed."""
     counts = {"pushed": 0, "pulled": 0, "deleted_local": 0, "deleted_remote": 0,
-              "adopted": 0, "products": 0, "aliases": 0}
+              "adopted": 0, "products": 0, "aliases": 0,
+              "settings_backed_up": 0, "settings_restored": 0}
+
+    identity = pc_id if pc_id is not None else config.pc_id()
 
     # 1. Deletions win over existence: propagate tombstones both ways first.
     local_dels = {r["uid"] for r in local.query("SELECT uid FROM sync_deletions")}
@@ -60,7 +65,33 @@ def sync_databases(local: Database, remote: Database) -> dict[str, int]:
         if alias not in remote_aliases:
             remote.add_vendor_alias(alias, vendor)
             counts["aliases"] += 1
+    counts["settings_backed_up"], counts["settings_restored"] = _sync_settings(local, remote, identity)
     return counts
+
+
+def _sync_settings(local: Database, remote: Database, pc_id: str) -> tuple[int, int]:
+    # Never use the legacy global settings table as a source of restored preferences.
+    saved = {r["key"]: r["value"] for r in remote.query(
+        "SELECT key, value FROM pc_settings WHERE pc_id = ?", (pc_id,)) if r["key"] in PC_SETTING_KEYS}
+    current = {r["key"]: r["value"] for r in local.query("SELECT key, value FROM settings")
+               if r["key"] in PC_SETTING_KEYS}
+    backed_up = 0
+    with remote.transaction() as c:
+        for key, value in current.items():
+            if key not in saved or saved[key] != value:
+                c.execute(
+                    "INSERT INTO pc_settings(pc_id, key, value, updated_at) VALUES(?, ?, ?, ?) "
+                    "ON CONFLICT(pc_id, key) DO UPDATE SET value = excluded.value, "
+                    "updated_at = excluded.updated_at", (pc_id, key, value, now_iso()))
+                backed_up += 1
+    # Restore last: a failed server write must not leave the UI unaware of restored values.
+    restored = 0
+    with local.transaction() as c:
+        for key, value in saved.items():
+            if c.execute("SELECT 1 FROM settings WHERE key = ?", (key,)).fetchone() is None:
+                c.execute("INSERT INTO settings(key, value) VALUES(?, ?)", (key, value))
+                restored += 1
+    return backed_up, restored
 
 
 def _apply_deletion(db: Database, uid: str) -> int:
@@ -138,6 +169,7 @@ class SyncManager(QObject):
     status_changed = Signal(str)   # short status for the settings page
     finished = Signal(bool, str)   # ok, summary/error
     pulled_changes = Signal()      # remote changes landed locally; refresh the UI
+    settings_restored = Signal()
 
     def __init__(self, db: Database, parent: QObject | None = None):
         super().__init__(parent)
@@ -196,7 +228,11 @@ class SyncManager(QObject):
         parts = [f"{counts[k]} {label}" for k, label in
                  (("pushed", "sent"), ("pulled", "received"), ("adopted", "matched"),
                   ("deleted_local", "removed here"), ("deleted_remote", "removed on server"),
-                  ("products", "product details"), ("aliases", "aliases")) if counts[k]]
+                  ("products", "product details"), ("aliases", "aliases"),
+                  ("settings_backed_up", "settings backed up"),
+                  ("settings_restored", "settings restored")) if counts[k]]
+        if counts["settings_restored"]:
+            self.settings_restored.emit()
         if counts["pulled"] or counts["deleted_local"] or counts["products"] or counts["aliases"]:
             self.pulled_changes.emit()
         self.finished.emit(True, ", ".join(parts) if parts else "already up to date")
