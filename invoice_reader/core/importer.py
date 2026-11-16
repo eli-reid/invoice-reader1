@@ -3,8 +3,11 @@ inbox for review, and commit reviewed invoices to the database."""
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
@@ -12,7 +15,7 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal
 from invoice_reader import config
 from invoice_reader.db import (
     INBOX_FAILED, INBOX_IGNORED, INBOX_IMPORTED, INBOX_PENDING, INBOX_PROCESSING, INBOX_SKIPPED,
-    Database, DuplicateInvoiceError,
+    Database, DuplicateInvoiceError, ImportCancelledError,
 )
 from invoice_reader.extraction.pipeline import file_sha256, is_supported, process_file
 from invoice_reader.models import ParsedInvoice
@@ -23,25 +26,88 @@ QUEUED, DUPLICATE, KNOWN, UNSUPPORTED, ERROR = "queued", "duplicate", "known", "
 
 
 class _JobSignals(QObject):
-    finished = Signal(int, object)
-    failed = Signal(int, str)
+    finished = Signal(str, object)
 
 
-class _ParseJob(QRunnable):
-    def __init__(self, inbox_id: int, path: str, file_hash: str, vendors: list[str], exclude: list[str],
-                 aliases: dict[str, str]):
+@dataclass
+class _ImportResult:
+    outcome: str
+    title: str = ""
+    message: str = ""
+    saved: bool = False
+
+
+class _ImportJob(QRunnable):
+    def __init__(self, db: Database, key: str, path: str, source: str, force: bool,
+                 inbox_id: int | None = None):
         super().__init__()
-        self.inbox_id, self.path, self.file_hash = inbox_id, path, file_hash
-        self.vendors, self.exclude, self.aliases = vendors, exclude, aliases
+        self.db, self.key, self.path = db, key, path
+        self.source, self.force, self.inbox_id = source, force, inbox_id
         self.signals = _JobSignals()
 
     def run(self) -> None:
+        db = self.db
         try:
-            parsed = process_file(self.path, self.vendors, self.file_hash, self.exclude, self.aliases)
-            self.signals.finished.emit(self.inbox_id, parsed)
+            # WAL lets the UI keep reading while an automatic save writes many lines.
+            if db.backend.engine == "sqlite" and db.path != ":memory:":
+                db = Database(db.path)
+            result = self._process(db)
         except Exception as exc:  # noqa: BLE001 - report every failure to the inbox
             log.exception("Failed to process %s", self.path)
-            self.signals.failed.emit(self.inbox_id, f"{type(exc).__name__}: {exc}")
+            error = f"{type(exc).__name__}: {exc}"
+            if self.inbox_id is not None:
+                try:
+                    db.inbox_update(self.inbox_id, INBOX_FAILED, error=error, expected_status=INBOX_PROCESSING)
+                except Exception:
+                    log.exception("Could not record import failure for %s", self.path)
+            result = _ImportResult(ERROR, "Could not read invoice", f"{Path(self.path).name}: {error}")
+        finally:
+            if db is not self.db:
+                db.close()
+        self.signals.finished.emit(self.key, result)
+
+    def _process(self, db: Database) -> _ImportResult:
+        path = Path(self.path)
+        name = path.name
+        file_hash = file_sha256(path)
+        if self.inbox_id is None:
+            if not self.force and db.invoice_by_hash(file_hash):
+                return _ImportResult(DUPLICATE, "Already imported", name)
+            row = db.inbox_by_hash(file_hash)
+            if row and not self.force:
+                if self.source == "watch" or row["status"] in (
+                        INBOX_PENDING, INBOX_FAILED, INBOX_PROCESSING):
+                    return _ImportResult(KNOWN)
+            self.inbox_id = db.inbox_upsert(str(path), file_hash, path.stat().st_size, self.source)
+        parsed = process_file(
+            self.path, db.vendor_names(), file_hash,
+            [n.strip() for n in db.get_setting("company_names").split(";") if n.strip()],
+            db.vendor_aliases())
+        row = db.inbox_get(self.inbox_id)
+        if row is None or row["status"] != INBOX_PROCESSING:
+            return _ImportResult(KNOWN)  # removed or ignored while the worker was reading
+        if not parsed.looks_like_invoice:
+            db.inbox_update(self.inbox_id, INBOX_SKIPPED, parsed=parsed, error="Not recognized as an invoice.",
+                            expected_status=INBOX_PROCESSING)
+            return _ImportResult(QUEUED, "Not an invoice" if self.source == "manual" else "",
+                                 f"{name} doesn't look like an invoice.")
+        if (db.get_bool("auto_import") and parsed.is_clean
+                and not db.find_invoice(parsed.vendor, parsed.invoice_number)):
+            try:
+                ImportManager._commit(db, self.inbox_id, parsed, automatic=True)
+            except ImportCancelledError:
+                return _ImportResult(KNOWN)
+            except Exception as exc:  # retain the parsed invoice for manual review
+                log.exception("Auto-import failed for %s", name)
+                db.inbox_update(self.inbox_id, INBOX_PENDING, parsed=parsed,
+                                error=f"Automatic save failed: {exc}", expected_status=INBOX_PROCESSING)
+                return _ImportResult(ERROR, "Automatic save failed", f"{name}: {exc}. Ready for review.")
+            else:
+                return _ImportResult(QUEUED, "Invoice imported",
+                                     f"{parsed.vendor} #{parsed.invoice_number} - {len(parsed.lines)} line(s)",
+                                     saved=True)
+        db.inbox_update(self.inbox_id, INBOX_PENDING, parsed=parsed, expected_status=INBOX_PROCESSING)
+        return _ImportResult(QUEUED, "Invoice ready for review", f"{name} - {len(parsed.lines)} line(s) found")
 
 
 class ImportManager(QObject):
@@ -55,13 +121,18 @@ class ImportManager(QObject):
         self.db = db
         self.pool = QThreadPool(self)
         self.pool.setMaxThreadCount(1)  # OCR is CPU heavy; keep the UI responsive
-        self._jobs: dict[int, _ParseJob] = {}
+        self._jobs: dict[str, _ImportJob] = {}
+        self._pending: deque[tuple[str, str, str, bool, int | None]] = deque()
+        self._paths: set[str] = set()
+        self.accepting = True
+        self._data_dirty = False
+        self._changes = QTimer(self, singleShot=True, interval=500, timeout=self._emit_changes)
         self._notes: list[tuple[str, str]] = []
         self._flush = QTimer(self, singleShot=True, interval=1500, timeout=self._flush_notifications)
 
     @property
     def busy(self) -> int:
-        return len(self._jobs)
+        return len(self._paths)
 
     def company_names(self) -> list[str]:
         return [n.strip() for n in self.db.get_setting("company_names").split(";") if n.strip()]
@@ -69,119 +140,107 @@ class ImportManager(QObject):
     def resume(self) -> None:
         """Requeue files that were mid-processing when the app last exited."""
         for row in self.db.query("SELECT * FROM inbox WHERE status = ?", (INBOX_PROCESSING,)):
-            if Path(row["file_path"]).exists():
-                self._start(row["id"], row["file_path"], row["file_hash"])
-            else:
-                self.db.inbox_update(row["id"], INBOX_FAILED, error="File no longer exists.")
-        self.inbox_changed.emit()
+            self._submit(row["file_path"], row["source"], False, row["id"])
+        self._changed()
 
     def enqueue(self, path: str | Path, source: str = "manual", force: bool = False) -> str:
+        """Schedule a file without reading it. Duplicate/error results arrive later."""
         path = Path(path)
         if not is_supported(path):
             return UNSUPPORTED
-        try:
-            file_hash = file_sha256(path)
-            size = path.stat().st_size
-        except OSError as exc:
-            log.warning("Cannot read %s: %s", path, exc)
+        if not self.accepting:
             return ERROR
-        if not force and self.db.invoice_by_hash(file_hash):
-            return DUPLICATE
-        row = self.db.inbox_by_hash(file_hash)
-        if row and not force:
-            if row["id"] in self._jobs or source == "watch":
-                return KNOWN
-            if row["status"] in (INBOX_PENDING, INBOX_FAILED, INBOX_PROCESSING):
-                return KNOWN
-        inbox_id = self.db.inbox_upsert(str(path), file_hash, size, source)
-        self._start(inbox_id, str(path), file_hash)
-        self.inbox_changed.emit()
-        return QUEUED
+        return self._submit(str(path), source, force)
 
     def reprocess(self, inbox_id: int) -> str:
         row = self.db.inbox_get(inbox_id)
         if not row:
             return ERROR
-        if not Path(row["file_path"]).exists():
-            self.db.inbox_update(inbox_id, INBOX_FAILED, error="File no longer exists.")
-            self.inbox_changed.emit()
-            return ERROR
         return self.enqueue(row["file_path"], row["source"], force=True)
 
     def ignore(self, inbox_id: int) -> None:
         self.db.inbox_update(inbox_id, INBOX_IGNORED)
-        self.inbox_changed.emit()
+        self._changed()
 
-    def _start(self, inbox_id: int, path: str, file_hash: str) -> None:
-        if inbox_id in self._jobs:
+    def _submit(self, path: str, source: str, force: bool, inbox_id: int | None = None) -> str:
+        key = os.path.normcase(os.path.abspath(path))
+        if key in self._paths:
+            return KNOWN
+        self._paths.add(key)
+        self._pending.append((key, path, source, force, inbox_id))
+        self._changed()
+        if self.busy == 1:
+            self.busy_changed.emit(self.busy)
+            QTimer.singleShot(0, self._start_next)
+        return QUEUED
+
+    def _start_next(self) -> None:
+        if self._jobs or not self._pending:
             return
-        job = _ParseJob(inbox_id, path, file_hash, self.db.vendor_names(), self.company_names(),
-                        self.db.vendor_aliases())
+        key, path, source, force, inbox_id = self._pending.popleft()
+        job = _ImportJob(self.db, key, path, source, force, inbox_id)
         job.setAutoDelete(False)
         job.signals.finished.connect(self._on_finished)
-        job.signals.failed.connect(self._on_failed)
-        self._jobs[inbox_id] = job
+        self._jobs[key] = job
         self.pool.start(job)
         self.busy_changed.emit(self.busy)
 
-    def _done(self, inbox_id: int) -> str:
-        job = self._jobs.pop(inbox_id, None)
+    def _on_finished(self, key: str, result: _ImportResult) -> None:
+        self._jobs.pop(key, None)
+        self._paths.discard(key)
+        if result.title:
+            self._queue_note(result.title, result.message)
+        self._changed(result.saved)
         self.busy_changed.emit(self.busy)
-        return Path(job.path).name if job else ""
+        if not self.busy:
+            self._changes.stop()
+            self._emit_changes()
+        else:
+            self._start_next()
 
-    def _on_failed(self, inbox_id: int, error: str) -> None:
-        name = self._done(inbox_id)
-        self.db.inbox_update(inbox_id, INBOX_FAILED, error=error)
-        self._queue_note("Could not read invoice", f"{name}: {error}")
-        self.inbox_changed.emit()
+    def _changed(self, saved: bool = False) -> None:
+        self._data_dirty |= saved
+        if not self._changes.isActive():
+            self._changes.start()
 
-    def _on_finished(self, inbox_id: int, parsed: ParsedInvoice) -> None:
-        name = self._done(inbox_id)
-        row = self.db.inbox_get(inbox_id)
-        if row is None:
-            return
-        if not parsed.looks_like_invoice:
-            self.db.inbox_update(inbox_id, INBOX_SKIPPED, parsed=parsed, error="Not recognized as an invoice.")
-            if row["source"] == "manual":
-                self._queue_note("Not an invoice", f"{name} doesn't look like an invoice.")
-            self.inbox_changed.emit()
-            return
-        self.db.inbox_update(inbox_id, INBOX_PENDING, parsed=parsed)
-        if (self.db.get_bool("auto_import") and parsed.is_clean
-                and not self.db.find_invoice(parsed.vendor, parsed.invoice_number)):
-            try:
-                self.commit(inbox_id, parsed)
-                self._queue_note("Invoice imported",
-                                 f"{parsed.vendor} #{parsed.invoice_number} - {len(parsed.lines)} line(s)")
-                return
-            except Exception:  # noqa: BLE001 - fall back to manual review
-                log.exception("Auto-import failed for %s", name)
-        self._queue_note("Invoice ready for review", f"{name} - {len(parsed.lines)} line(s) found")
+    def _emit_changes(self) -> None:
+        saved, self._data_dirty = self._data_dirty, False
         self.inbox_changed.emit()
+        if saved:
+            self.data_changed.emit()
 
     def commit(self, inbox_id: int, parsed: ParsedInvoice, allow_duplicate: bool = False) -> int:
-        if not allow_duplicate:
-            existing = self.db.find_invoice(parsed.vendor, parsed.invoice_number)
-            if existing:
-                raise DuplicateInvoiceError(existing)
-        archived = self._archive(parsed)
-        self._learn_vendor(inbox_id, parsed.vendor)
-        invoice_id = self.db.save_invoice(parsed, archived, allow_duplicate=True)
-        self.db.inbox_update(inbox_id, INBOX_IMPORTED, parsed=parsed, invoice_id=invoice_id)
-        log.info("Imported invoice %s from %s (%d lines)", parsed.invoice_number, parsed.vendor, len(parsed.lines))
-        self.inbox_changed.emit()
-        self.data_changed.emit()
+        invoice_id = self._commit(self.db, inbox_id, parsed, allow_duplicate)
+        self._changed(saved=True)
         return invoice_id
 
-    def _learn_vendor(self, inbox_id: int, vendor: str) -> None:
+    @staticmethod
+    def _commit(db: Database, inbox_id: int, parsed: ParsedInvoice, allow_duplicate: bool = False,
+                automatic: bool = False) -> int:
+        if not allow_duplicate:
+            existing = db.find_invoice(parsed.vendor, parsed.invoice_number)
+            if existing:
+                raise DuplicateInvoiceError(existing)
+        archived = ImportManager._archive(parsed)
+        if not automatic:
+            ImportManager._learn_vendor(db, inbox_id, parsed.vendor)
+        invoice_id = db.save_invoice(parsed, archived, allow_duplicate=True,
+                                     processing_inbox_id=inbox_id if automatic else None)
+        if not automatic:
+            db.inbox_update(inbox_id, INBOX_IMPORTED, parsed=parsed, invoice_id=invoice_id)
+        log.info("Imported invoice %s from %s (%d lines)", parsed.invoice_number, parsed.vendor, len(parsed.lines))
+        return invoice_id
+
+    @staticmethod
+    def _learn_vendor(db: Database, inbox_id: int, vendor: str) -> None:
         """If the user corrected a guessed vendor, remember the guess so the same
         letterhead maps to the right vendor next time."""
-        row = self.db.inbox_get(inbox_id)
+        row = db.inbox_get(inbox_id)
         if not row or not row["parsed_json"]:
             return
         guess = ParsedInvoice.from_json(row["parsed_json"]).vendor
         if guess and vendor and guess.lower() != vendor.lower():
-            self.db.add_vendor_alias(guess, vendor)
+            db.add_vendor_alias(guess, vendor)
             log.info("Learned vendor alias %r -> %r", guess, vendor)
 
     @staticmethod
@@ -200,7 +259,8 @@ class ImportManager(QObject):
 
     def _queue_note(self, title: str, message: str) -> None:
         self._notes.append((title, message))
-        self._flush.start()
+        if not self._flush.isActive():
+            self._flush.start()
 
     def _flush_notifications(self) -> None:
         notes, self._notes = self._notes, []

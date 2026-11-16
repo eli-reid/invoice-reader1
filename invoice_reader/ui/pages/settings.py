@@ -236,8 +236,8 @@ class SettingsPage(QWidget):
         if QMessageBox.question(self, "Scan existing files",
                                 "Read every invoice file currently in the watch folder?\n\n"
                                 "Files already imported are skipped automatically.") == QMessageBox.Yes:
-            n = self.win.watcher.scan(include_existing=True)
-            self.win.notify("Scan started", f"{n} file(s) queued for reading.")
+            self.win.watcher.scan(include_existing=True)
+            self.win.notify("Scan started", "Scanning existing files in the background.")
 
     def _toggle_autostart(self, enabled: bool) -> None:
         try:

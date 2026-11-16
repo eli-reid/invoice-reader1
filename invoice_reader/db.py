@@ -171,6 +171,10 @@ class DuplicateInvoiceError(Exception):
         self.invoice_id = invoice_id
 
 
+class ImportCancelledError(Exception):
+    """The inbox entry was ignored or removed while its file was processing."""
+
+
 class Database:
     def __init__(self, source: str | Path | Backend):
         self.backend = source if isinstance(source, Backend) else SQLiteBackend(source)
@@ -318,7 +322,8 @@ class Database:
         return row["id"] if row else None
 
     def save_invoice(self, inv: ParsedInvoice, archived_path: str | None = None,
-                     allow_duplicate: bool = False, sync_uid: str | None = None) -> int:
+                     allow_duplicate: bool = False, sync_uid: str | None = None,
+                     processing_inbox_id: int | None = None) -> int:
         if not allow_duplicate:
             existing = self.find_invoice(inv.vendor, inv.invoice_number)
             if existing:
@@ -327,6 +332,10 @@ class Database:
         price_date = inv.invoice_date or ts[:10]
         match_mfr = self.get_bool("match_manufacturer")
         with self.transaction() as c:
+            if processing_inbox_id is not None:
+                row = c.execute("SELECT status FROM inbox WHERE id = ?", (processing_inbox_id,)).fetchone()
+                if row is None or row["status"] != INBOX_PROCESSING:
+                    raise ImportCancelledError()
             vendor_id = self._vendor_id(c, inv.vendor)
             file_hash = inv.file_hash or None
             if file_hash and c.execute("SELECT 1 FROM invoices WHERE file_hash = ?", (file_hash,)).fetchone():
@@ -348,6 +357,8 @@ class Database:
                     (product_id, invoice_id, vendor_id, price_date, line.description.strip(), line.quantity,
                      line.uom or "EA", line.unit_price, line.price_per or 1, line.unit_cost,
                      line.extended if line.extended is not None else line.computed_extended))
+            if processing_inbox_id is not None:
+                self.inbox_update(processing_inbox_id, INBOX_IMPORTED, parsed=inv, invoice_id=invoice_id)
         return invoice_id
 
     @staticmethod
@@ -549,7 +560,8 @@ class Database:
             return c.execute("SELECT id FROM inbox WHERE file_hash = ?", (file_hash,)).fetchone()["id"]
 
     def inbox_update(self, inbox_id: int, status: str, parsed: ParsedInvoice | None = None,
-                     error: str | None = None, invoice_id: int | None = None) -> None:
+                     error: str | None = None, invoice_id: int | None = None,
+                     expected_status: str | None = None) -> None:
         sets = ["status = ?", "updated_at = ?", "error = ?"]
         params: list = [status, now_iso(), error]
         if parsed is not None:
@@ -559,7 +571,11 @@ class Database:
             sets.append("invoice_id = ?")
             params.append(invoice_id)
         params.append(inbox_id)
-        self.execute(f"UPDATE inbox SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        where = "id = ?"
+        if expected_status is not None:
+            where += " AND status = ?"
+            params.append(expected_status)
+        self.execute(f"UPDATE inbox SET {', '.join(sets)} WHERE {where}", tuple(params))
 
     def inbox_list(self, active_only: bool = True) -> list[Row]:
         where = f"WHERE status IN ({','.join('?' * len(INBOX_ACTIVE))})" if active_only else ""

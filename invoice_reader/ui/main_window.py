@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
     QMessageBox, QStackedWidget, QSystemTrayIcon, QVBoxLayout, QWidget,
@@ -86,6 +86,7 @@ class MainWindow(QMainWindow):
             "settings": SettingsPage(self),
         }
         self._dirty = set(self.pages)
+        self._refresh_timer = QTimer(self, singleShot=True, interval=750, timeout=self._refresh_pending)
         for key, label, glyph in NAV:
             item = QListWidgetItem(glyph_icon(glyph, size=32), label)
             item.setData(Qt.UserRole, key)
@@ -139,8 +140,16 @@ class MainWindow(QMainWindow):
 
     def data_changed(self) -> None:
         self._dirty.update(self.pages)
-        self._refresh_if_dirty(self._current_key())
+        self._schedule_refresh()
         self.sync.request_sync()
+
+    def _schedule_refresh(self) -> None:
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def _refresh_pending(self) -> None:
+        self._update_badge()
+        self._refresh_if_dirty(self._current_key())
 
     def _on_sync_finished(self, ok: bool, summary: str) -> None:
         if not ok:
@@ -171,7 +180,7 @@ class MainWindow(QMainWindow):
             results[outcome] = results.get(outcome, 0) + 1
         parts = []
         if results[QUEUED]:
-            parts.append(f"{results[QUEUED]} file(s) are being read")
+            parts.append(f"{results[QUEUED]} file(s) submitted for background processing")
         if results[DUPLICATE]:
             parts.append(f"{results[DUPLICATE]} already imported")
         if results["known"]:
@@ -221,9 +230,7 @@ class MainWindow(QMainWindow):
         if not self.watcher.enabled:
             QMessageBox.information(self, "Watch folder off", "Turn on the watch folder in Settings first.")
             return
-        n = self.watcher.scan()
-        self.statusBar().showMessage(f"Scan complete - {n} new file(s) queued" if n else
-                                     "Scan complete - no new invoices", 6000)
+        self.watcher.scan()
 
     def choose_watch_folder(self) -> None:
         current = self.db.get_setting("watch_folder")
@@ -248,14 +255,11 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip(f"{APP_NAME}\n{text}"[:127])
 
     def _on_busy(self, count: int) -> None:
-        self.busy_label.setText(f"\u23f3 Reading {count} file(s)..." if count else "")
-        if count == 0:
-            self._on_inbox_changed()
+        self.busy_label.setText(f"\u23f3 Processing {count} file(s) remaining..." if count else "")
 
     def _on_inbox_changed(self) -> None:
-        self._update_badge()
         self._dirty.update({"inbox", "dashboard", "invoices"})
-        self._refresh_if_dirty(self._current_key())
+        self._schedule_refresh()
 
     def _update_badge(self) -> None:
         pending = self.db.query_one(
@@ -304,8 +308,14 @@ class MainWindow(QMainWindow):
                 self.notify(APP_NAME, "Still watching for new invoices in the background. "
                                       "Right-click the tray icon to quit.")
             return
+        self.watcher.stop()
+        self.importer.accepting = False
+        if (self.importer.busy or self.importer.pool.activeThreadCount()
+                or self.watcher.pool.activeThreadCount()):
+            event.ignore()
+            self.statusBar().showMessage("Finishing background imports before exiting...")
+            QTimer.singleShot(100, self.close)
+            return
         self.tray.hide()
-        self.importer.pool.clear()
-        self.importer.pool.waitForDone(5000)
         event.accept()
         QApplication.quit()

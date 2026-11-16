@@ -70,6 +70,11 @@ running the newest `InvoiceReaderSetup.exe`.
 - **Import queue** - each file is shown next to the extracted lines for review. Fix anything, then
   *Save to database*. With *Save invoices automatically when every line checks out* on (Settings),
   invoices whose math fully checks out are saved without review.
+  Folder scans, file hashing, duplicate checks, PDF/OCR extraction, and automatic archiving/saving
+  run in the background. Files process one at a time to limit memory/CPU usage; the sidebar shows
+  how many remain, and list updates are batched instead of rebuilding after every file.
+  Duplicate and unreadable files are reported after background checks complete. Quitting waits
+  for submitted imports to finish without blocking the window.
 - **Vendors** - detected from the letterhead (OCR of the logo if needed). If you correct a vendor while
   reviewing, the app remembers it for that vendor's future invoices. Your own company name
   (Settings > *Your company name(s)*, default "Midstate Electric") is never picked as the vendor.
